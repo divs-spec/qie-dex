@@ -2,7 +2,7 @@
   "name": "qie-backend",
   "version": "1.0.0",
   "main": "server.js",
-  "type": "module",
+  "type": "commonjs",
   "scripts": {
     "dev": "NODE_ENV=development node server.js",
     "start": "node server.js",
