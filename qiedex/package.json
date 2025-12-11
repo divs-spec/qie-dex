@@ -1,0 +1,22 @@
+{
+  "name": "qie-dex-monorepo",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "backend",
+    "websocket",
+    "contracts"
+  ],
+  "scripts": {
+    "install:all": "npm install --workspaces",
+    "dev:frontend": "cd frontend && npm start",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:websocket": "cd websocket && npm run dev",
+    "dev": "concurrently \"npm:dev:frontend\" \"npm:dev:backend\" \"npm:dev:websocket\"",
+    "build:frontend": "cd frontend && npm run build"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.0",
+    "npm-run-all": "^4.1.5"
+  }
+}
