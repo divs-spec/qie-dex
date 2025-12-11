@@ -1,0 +1,666 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+// ==================== INTERFACES ====================
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+interface IQIEPair {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external;
+}
+
+interface IQIEFactory {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+    function createPair(address tokenA, address tokenB) external returns (address pair);
+}
+
+// ==================== LIBRARIES ====================
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        uint256 c = a + b;
+        require(c >= a, "SafeMath: addition overflow");
+        return c;
+    }
+
+    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
+        require(b <= a, "SafeMath: subtraction overflow");
+        return a - b;
+    }
+
+    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == 0) return 0;
+        uint256 c = a * b;
+        require(c / a == b, "SafeMath: multiplication overflow");
+        return c;
+    }
+
+    function div(uint256 a, uint256 b) internal pure returns (uint256) {
+        require(b > 0, "SafeMath: division by zero");
+        return a / b;
+    }
+}
+
+// ==================== QIE ROUTER CONTRACT ====================
+
+contract QIERouter {
+    using SafeMath for uint256;
+
+    address public immutable factory;
+    address public immutable WQIE; // Wrapped QIE
+    address public auditRegistry;
+    
+    modifier ensure(uint deadline) {
+        require(deadline >= block.timestamp, 'QIERouter: EXPIRED');
+        _;
+    }
+
+    event SwapExecuted(
+        address indexed user,
+        address[] path,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 timestamp
+    );
+
+    event LiquidityAdded(
+        address indexed user,
+        address indexed tokenA,
+        address indexed tokenB,
+        uint256 amountA,
+        uint256 amountB,
+        uint256 liquidity
+    );
+
+    constructor(address _factory, address _WQIE, address _auditRegistry) {
+        factory = _factory;
+        WQIE = _WQIE;
+        auditRegistry = _auditRegistry;
+    }
+
+    receive() external payable {
+        assert(msg.sender == WQIE);
+    }
+
+    // ==================== SWAP FUNCTIONS ====================
+
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external ensure(deadline) returns (uint256[] memory amounts) {
+        amounts = getAmountsOut(amountIn, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, 'QIERouter: INSUFFICIENT_OUTPUT_AMOUNT');
+        
+        IERC20(path[0]).transferFrom(msg.sender, pairFor(path[0], path[1]), amounts[0]);
+        _swap(amounts, path, to);
+        
+        emit SwapExecuted(msg.sender, path, amountIn, amounts[amounts.length - 1], block.timestamp);
+        
+        return amounts;
+    }
+
+    function swapTokensForExactTokens(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external ensure(deadline) returns (uint256[] memory amounts) {
+        amounts = getAmountsIn(amountOut, path);
+        require(amounts[0] <= amountInMax, 'QIERouter: EXCESSIVE_INPUT_AMOUNT');
+        
+        IERC20(path[0]).transferFrom(msg.sender, pairFor(path[0], path[1]), amounts[0]);
+        _swap(amounts, path, to);
+        
+        emit SwapExecuted(msg.sender, path, amounts[0], amountOut, block.timestamp);
+        
+        return amounts;
+    }
+
+    function swapExactQIEForTokens(
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable ensure(deadline) returns (uint256[] memory amounts) {
+        require(path[0] == WQIE, 'QIERouter: INVALID_PATH');
+        amounts = getAmountsOut(msg.value, path);
+        require(amounts[amounts.length - 1] >= amountOutMin, 'QIERouter: INSUFFICIENT_OUTPUT_AMOUNT');
+        
+        IWQIE(WQIE).deposit{value: amounts[0]}();
+        assert(IWQIE(WQIE).transfer(pairFor(path[0], path[1]), amounts[0]));
+        _swap(amounts, path, to);
+        
+        emit SwapExecuted(msg.sender, path, msg.value, amounts[amounts.length - 1], block.timestamp);
+        
+        return amounts;
+    }
+
+    function swapTokensForExactQIE(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external ensure(deadline) returns (uint256[] memory amounts) {
+        require(path[path.length - 1] == WQIE, 'QIERouter: INVALID_PATH');
+        amounts = getAmountsIn(amountOut, path);
+        require(amounts[0] <= amountInMax, 'QIERouter: EXCESSIVE_INPUT_AMOUNT');
+        
+        IERC20(path[0]).transferFrom(msg.sender, pairFor(path[0], path[1]), amounts[0]);
+        _swap(amounts, path, address(this));
+        IWQIE(WQIE).withdraw(amounts[amounts.length - 1]);
+        _safeTransferQIE(to, amounts[amounts.length - 1]);
+        
+        emit SwapExecuted(msg.sender, path, amounts[0], amountOut, block.timestamp);
+        
+        return amounts;
+    }
+
+    // ==================== LIQUIDITY FUNCTIONS ====================
+
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint deadline
+    ) external ensure(deadline) returns (uint256 amountA, uint256 amountB, uint256 liquidity) {
+        (amountA, amountB) = _addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin);
+        address pair = pairFor(tokenA, tokenB);
+        IERC20(tokenA).transferFrom(msg.sender, pair, amountA);
+        IERC20(tokenB).transferFrom(msg.sender, pair, amountB);
+        liquidity = IQIEPair(pair).mint(to);
+        
+        emit LiquidityAdded(msg.sender, tokenA, tokenB, amountA, amountB, liquidity);
+    }
+
+    function addLiquidityQIE(
+        address token,
+        uint256 amountTokenDesired,
+        uint256 amountTokenMin,
+        uint256 amountQIEMin,
+        address to,
+        uint deadline
+    ) external payable ensure(deadline) returns (uint256 amountToken, uint256 amountQIE, uint256 liquidity) {
+        (amountToken, amountQIE) = _addLiquidity(
+            token,
+            WQIE,
+            amountTokenDesired,
+            msg.value,
+            amountTokenMin,
+            amountQIEMin
+        );
+        address pair = pairFor(token, WQIE);
+        IERC20(token).transferFrom(msg.sender, pair, amountToken);
+        IWQIE(WQIE).deposit{value: amountQIE}();
+        assert(IWQIE(WQIE).transfer(pair, amountQIE));
+        liquidity = IQIEPair(pair).mint(to);
+        
+        if (msg.value > amountQIE) _safeTransferQIE(msg.sender, msg.value - amountQIE);
+        
+        emit LiquidityAdded(msg.sender, token, WQIE, amountToken, amountQIE, liquidity);
+    }
+
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint deadline
+    ) external ensure(deadline) returns (uint256 amountA, uint256 amountB) {
+        address pair = pairFor(tokenA, tokenB);
+        IQIEPair(pair).transferFrom(msg.sender, pair, liquidity);
+        (uint amount0, uint amount1) = IQIEPair(pair).burn(to);
+        (address token0,) = sortTokens(tokenA, tokenB);
+        (amountA, amountB) = tokenA == token0 ? (amount0, amount1) : (amount1, amount0);
+        require(amountA >= amountAMin, 'QIERouter: INSUFFICIENT_A_AMOUNT');
+        require(amountB >= amountBMin, 'QIERouter: INSUFFICIENT_B_AMOUNT');
+    }
+
+    // ==================== VIEW FUNCTIONS ====================
+
+    function getAmountsOut(uint256 amountIn, address[] memory path) public view returns (uint256[] memory amounts) {
+        require(path.length >= 2, 'QIERouter: INVALID_PATH');
+        amounts = new uint256[](path.length);
+        amounts[0] = amountIn;
+        for (uint i; i < path.length - 1; i++) {
+            (uint reserveIn, uint reserveOut) = getReserves(path[i], path[i + 1]);
+            amounts[i + 1] = getAmountOut(amounts[i], reserveIn, reserveOut);
+        }
+    }
+
+    function getAmountsIn(uint256 amountOut, address[] memory path) public view returns (uint256[] memory amounts) {
+        require(path.length >= 2, 'QIERouter: INVALID_PATH');
+        amounts = new uint256[](path.length);
+        amounts[amounts.length - 1] = amountOut;
+        for (uint i = path.length - 1; i > 0; i--) {
+            (uint reserveIn, uint reserveOut) = getReserves(path[i - 1], path[i]);
+            amounts[i - 1] = getAmountIn(amounts[i], reserveIn, reserveOut);
+        }
+    }
+
+    function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) public pure returns (uint256 amountOut) {
+        require(amountIn > 0, 'QIERouter: INSUFFICIENT_INPUT_AMOUNT');
+        require(reserveIn > 0 && reserveOut > 0, 'QIERouter: INSUFFICIENT_LIQUIDITY');
+        uint256 amountInWithFee = amountIn.mul(997);
+        uint256 numerator = amountInWithFee.mul(reserveOut);
+        uint256 denominator = reserveIn.mul(1000).add(amountInWithFee);
+        amountOut = numerator / denominator;
+    }
+
+    function getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut) public pure returns (uint256 amountIn) {
+        require(amountOut > 0, 'QIERouter: INSUFFICIENT_OUTPUT_AMOUNT');
+        require(reserveIn > 0 && reserveOut > 0, 'QIERouter: INSUFFICIENT_LIQUIDITY');
+        uint256 numerator = reserveIn.mul(amountOut).mul(1000);
+        uint256 denominator = reserveOut.sub(amountOut).mul(997);
+        amountIn = (numerator / denominator).add(1);
+    }
+
+    // ==================== INTERNAL FUNCTIONS ====================
+
+    function _addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin
+    ) internal returns (uint256 amountA, uint256 amountB) {
+        if (IQIEFactory(factory).getPair(tokenA, tokenB) == address(0)) {
+            IQIEFactory(factory).createPair(tokenA, tokenB);
+        }
+        (uint reserveA, uint reserveB) = getReserves(tokenA, tokenB);
+        if (reserveA == 0 && reserveB == 0) {
+            (amountA, amountB) = (amountADesired, amountBDesired);
+        } else {
+            uint amountBOptimal = quote(amountADesired, reserveA, reserveB);
+            if (amountBOptimal <= amountBDesired) {
+                require(amountBOptimal >= amountBMin, 'QIERouter: INSUFFICIENT_B_AMOUNT');
+                (amountA, amountB) = (amountADesired, amountBOptimal);
+            } else {
+                uint amountAOptimal = quote(amountBDesired, reserveB, reserveA);
+                assert(amountAOptimal <= amountADesired);
+                require(amountAOptimal >= amountAMin, 'QIERouter: INSUFFICIENT_A_AMOUNT');
+                (amountA, amountB) = (amountAOptimal, amountBDesired);
+            }
+        }
+    }
+
+    function _swap(uint256[] memory amounts, address[] memory path, address _to) internal {
+        for (uint i; i < path.length - 1; i++) {
+            (address input, address output) = (path[i], path[i + 1]);
+            (address token0,) = sortTokens(input, output);
+            uint amountOut = amounts[i + 1];
+            (uint amount0Out, uint amount1Out) = input == token0 ? (uint(0), amountOut) : (amountOut, uint(0));
+            address to = i < path.length - 2 ? pairFor(output, path[i + 2]) : _to;
+            IQIEPair(pairFor(input, output)).swap(amount0Out, amount1Out, to, new bytes(0));
+        }
+    }
+
+    function _safeTransferQIE(address to, uint256 value) internal {
+        (bool success,) = to.call{value: value}(new bytes(0));
+        require(success, 'QIERouter: QIE_TRANSFER_FAILED');
+    }
+
+    // ==================== HELPER FUNCTIONS ====================
+
+    function quote(uint256 amountA, uint256 reserveA, uint256 reserveB) public pure returns (uint256 amountB) {
+        require(amountA > 0, 'QIERouter: INSUFFICIENT_AMOUNT');
+        require(reserveA > 0 && reserveB > 0, 'QIERouter: INSUFFICIENT_LIQUIDITY');
+        amountB = amountA.mul(reserveB) / reserveA;
+    }
+
+    function pairFor(address tokenA, address tokenB) internal view returns (address pair) {
+        pair = IQIEFactory(factory).getPair(tokenA, tokenB);
+        require(pair != address(0), 'QIERouter: PAIR_NOT_FOUND');
+    }
+
+    function sortTokens(address tokenA, address tokenB) internal pure returns (address token0, address token1) {
+        require(tokenA != tokenB, 'QIERouter: IDENTICAL_ADDRESSES');
+        (token0, token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        require(token0 != address(0), 'QIERouter: ZERO_ADDRESS');
+    }
+
+    function getReserves(address tokenA, address tokenB) internal view returns (uint reserveA, uint reserveB) {
+        (address token0,) = sortTokens(tokenA, tokenB);
+        (uint reserve0, uint reserve1,) = IQIEPair(pairFor(tokenA, tokenB)).getReserves();
+        (reserveA, reserveB) = tokenA == token0 ? (reserve0, reserve1) : (reserve1, reserve0);
+    }
+}
+
+// ==================== AUDIT REGISTRY CONTRACT ====================
+
+contract QIEAuditRegistry {
+    struct AuditProof {
+        bytes32 proofHash;
+        string auditData;
+        uint256 timestamp;
+        address auditor;
+        bool verified;
+        uint256 blockNumber;
+    }
+
+    mapping(bytes32 => AuditProof) public auditProofs;
+    mapping(address => bytes32[]) public userAudits;
+    
+    address public owner;
+    uint256 public totalAudits;
+
+    event AuditProofWritten(
+        bytes32 indexed proofHash,
+        address indexed user,
+        uint256 timestamp,
+        uint256 blockNumber
+    );
+
+    event AuditVerified(
+        bytes32 indexed proofHash,
+        address indexed verifier,
+        uint256 timestamp
+    );
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this");
+        _;
+    }
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    function writeAuditProof(bytes32 proofHash, string memory auditData) external returns (bool) {
+        require(auditProofs[proofHash].timestamp == 0, "Proof already exists");
+        
+        auditProofs[proofHash] = AuditProof({
+            proofHash: proofHash,
+            auditData: auditData,
+            timestamp: block.timestamp,
+            auditor: msg.sender,
+            verified: true,
+            blockNumber: block.number
+        });
+        
+        userAudits[msg.sender].push(proofHash);
+        totalAudits++;
+        
+        emit AuditProofWritten(proofHash, msg.sender, block.timestamp, block.number);
+        
+        return true;
+    }
+
+    function verifyAuditProof(bytes32 proofHash) external view returns (bool verified, string memory auditData) {
+        AuditProof memory proof = auditProofs[proofHash];
+        return (proof.verified && proof.timestamp > 0, proof.auditData);
+    }
+
+    function getAuditProof(bytes32 proofHash) external view returns (AuditProof memory) {
+        return auditProofs[proofHash];
+    }
+
+    function getUserAudits(address user) external view returns (bytes32[] memory) {
+        return userAudits[user];
+    }
+
+    function getTotalAudits() external view returns (uint256) {
+        return totalAudits;
+    }
+}
+
+// ==================== ORDER BOOK CONTRACT ====================
+
+contract QIEOrderBook {
+    using SafeMath for uint256;
+
+    struct Order {
+        uint256 orderId;
+        address user;
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint256 amountOut;
+        uint256 price; // Price in basis points (10000 = 1.0)
+        uint256 timestamp;
+        uint256 expiresAt;
+        OrderType orderType;
+        OrderStatus status;
+        uint256 filled;
+    }
+
+    enum OrderType { LIMIT, STOP, STOP_LIMIT }
+    enum OrderStatus { OPEN, PARTIAL, FILLED, CANCELLED, EXPIRED }
+
+    mapping(uint256 => Order) public orders;
+    mapping(address => uint256[]) public userOrders;
+    mapping(bytes32 => uint256[]) public pairOrders; // keccak256(tokenIn, tokenOut) => orderIds
+    
+    uint256 public nextOrderId = 1;
+    uint256 public totalOrders;
+    address public router;
+    address public owner;
+
+    event OrderCreated(
+        uint256 indexed orderId,
+        address indexed user,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 price,
+        OrderType orderType
+    );
+
+    event OrderFilled(
+        uint256 indexed orderId,
+        address indexed user,
+        uint256 filledAmount,
+        uint256 timestamp
+    );
+
+    event OrderCancelled(
+        uint256 indexed orderId,
+        address indexed user,
+        uint256 timestamp
+    );
+
+    modifier onlyRouter() {
+        require(msg.sender == router, "Only router can call");
+        _;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call");
+        _;
+    }
+
+    constructor(address _router) {
+        router = _router;
+        owner = msg.sender;
+    }
+
+    function createOrder(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 price,
+        uint256 expiresAt,
+        OrderType orderType
+    ) external returns (uint256 orderId) {
+        require(amountIn > 0, "Amount must be > 0");
+        require(expiresAt > block.timestamp, "Invalid expiry");
+        
+        // Transfer tokens to contract
+        IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
+        
+        orderId = nextOrderId++;
+        
+        orders[orderId] = Order({
+            orderId: orderId,
+            user: msg.sender,
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            amountIn: amountIn,
+            amountOut: amountOut,
+            price: price,
+            timestamp: block.timestamp,
+            expiresAt: expiresAt,
+            orderType: orderType,
+            status: OrderStatus.OPEN,
+            filled: 0
+        });
+        
+        userOrders[msg.sender].push(orderId);
+        bytes32 pairKey = keccak256(abi.encodePacked(tokenIn, tokenOut));
+        pairOrders[pairKey].push(orderId);
+        
+        totalOrders++;
+        
+        emit OrderCreated(orderId, msg.sender, tokenIn, tokenOut, amountIn, price, orderType);
+        
+        return orderId;
+    }
+
+    function cancelOrder(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        require(order.user == msg.sender, "Not order owner");
+        require(order.status == OrderStatus.OPEN || order.status == OrderStatus.PARTIAL, "Cannot cancel");
+        
+        uint256 remainingAmount = order.amountIn.sub(order.filled);
+        order.status = OrderStatus.CANCELLED;
+        
+        // Return remaining tokens
+        IERC20(order.tokenIn).transfer(msg.sender, remainingAmount);
+        
+        emit OrderCancelled(orderId, msg.sender, block.timestamp);
+    }
+
+    function fillOrder(uint256 orderId, uint256 fillAmount) external onlyRouter returns (bool) {
+        Order storage order = orders[orderId];
+        require(order.status == OrderStatus.OPEN || order.status == OrderStatus.PARTIAL, "Order not fillable");
+        require(block.timestamp <= order.expiresAt, "Order expired");
+        
+        uint256 remainingAmount = order.amountIn.sub(order.filled);
+        require(fillAmount <= remainingAmount, "Fill amount too large");
+        
+        order.filled = order.filled.add(fillAmount);
+        
+        if (order.filled >= order.amountIn) {
+            order.status = OrderStatus.FILLED;
+        } else {
+            order.status = OrderStatus.PARTIAL;
+        }
+        
+        emit OrderFilled(orderId, order.user, fillAmount, block.timestamp);
+        
+        return true;
+    }
+
+    function getOrder(uint256 orderId) external view returns (Order memory) {
+        return orders[orderId];
+    }
+
+    function getUserOrders(address user) external view returns (uint256[] memory) {
+        return userOrders[user];
+    }
+
+    function getPairOrders(address tokenIn, address tokenOut) external view returns (uint256[] memory) {
+        bytes32 pairKey = keccak256(abi.encodePacked(tokenIn, tokenOut));
+        return pairOrders[pairKey];
+    }
+
+    function expireOrder(uint256 orderId) external {
+        Order storage order = orders[orderId];
+        require(block.timestamp > order.expiresAt, "Order not expired");
+        require(order.status == OrderStatus.OPEN || order.status == OrderStatus.PARTIAL, "Already finalized");
+        
+        order.status = OrderStatus.EXPIRED;
+        
+        uint256 remainingAmount = order.amountIn.sub(order.filled);
+        if (remainingAmount > 0) {
+            IERC20(order.tokenIn).transfer(order.user, remainingAmount);
+        }
+    }
+}
+
+// ==================== WRAPPED QIE ====================
+
+interface IWQIE {
+    function deposit() external payable;
+    function transfer(address to, uint value) external returns (bool);
+    function withdraw(uint) external;
+}
+
+contract WQIE is IWQIE {
+    string public name = "Wrapped QIE";
+    string public symbol = "WQIE";
+    uint8 public decimals = 18;
+
+    event Deposit(address indexed dst, uint wad);
+    event Withdrawal(address indexed src, uint wad);
+
+    mapping(address => uint) public balanceOf;
+    mapping(address => mapping(address => uint)) public allowance;
+
+    receive() external payable {
+        deposit();
+    }
+
+    function deposit() public payable {
+        balanceOf[msg.sender] += msg.value;
+        emit Deposit(msg.sender, msg.value);
+    }
+
+    function withdraw(uint wad) public {
+        require(balanceOf[msg.sender] >= wad, "Insufficient balance");
+        balanceOf[msg.sender] -= wad;
+        payable(msg.sender).transfer(wad);
+        emit Withdrawal(msg.sender, wad);
+    }
+
+    function totalSupply() public view returns (uint) {
+        return address(this).balance;
+    }
+
+    function approve(address guy, uint wad) public returns (bool) {
+        allowance[msg.sender][guy] = wad;
+        return true;
+    }
+
+    function transfer(address dst, uint wad) public returns (bool) {
+        return transferFrom(msg.sender, dst, wad);
+    }
+
+    function transferFrom(address src, address dst, uint wad) public returns (bool) {
+        require(balanceOf[src] >= wad, "Insufficient balance");
+
+        if (src != msg.sender && allowance[src][msg.sender] != type(uint).max) {
+            require(allowance[src][msg.sender] >= wad, "Insufficient allowance");
+            allowance[src][msg.sender] -= wad;
+        }
+
+        balanceOf[src] -= wad;
+        balanceOf[dst] += wad;
+
+        return true;
+    }
+}
