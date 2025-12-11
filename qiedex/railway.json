@@ -1,0 +1,13 @@
+{
+  "services": {
+    "api": {
+      "path": "backend",
+      "startCommand": "node server.js"
+    },
+    "websocket": {
+      "path": "websocket",
+      "startCommand": "node websocket-server.js"
+    }
+  },
+  "plugins": ["mongodb"]
+}
