@@ -16,7 +16,7 @@ const HTTP_PORT = 3002;
 const wss = new WebSocket.Server({ port: PORT });
 
 // Connect to QIE blockchain
-const provider = new ethers.providers.JsonRpcProvider('https://rpc.testnet.qie.digital');
+const provider = new ethers.JsonRpcProvider('https://rpc.testnet.qie.digital');
 const ROUTER_ADDRESS = '0x1234567890123456789012345678901234567890';
 const ORDER_BOOK_ADDRESS = '0x2345678901234567890123456789012345678901';
 
