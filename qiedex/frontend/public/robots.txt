@@ -1,0 +1,17 @@
+User-agent: *
+Allow: /
+```
+
+## Verify Your Project Structure
+
+Make sure you have:
+```
+qiedex/
+├── frontend/
+│   ├── public/
+│   │   ├── index.html
+│   │   ├── manifest.json
+│   │   └── robots.txt
+│   ├── src/
+│   │   └── index.js (or index.tsx)
+│   └── package.json
