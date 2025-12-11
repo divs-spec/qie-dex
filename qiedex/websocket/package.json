@@ -1,0 +1,13 @@
+{
+  "name": "qie-websocket",
+  "version": "1.0.0",
+  "main": "websocket-server.js",
+  "scripts": {
+    "dev": "NODE_ENV=development node websocket-server.js",
+    "start": "node websocket-server.js"
+  },
+  "dependencies": {
+    "ws": "^8.13.0",
+    "dotenv": "^16.3.1"
+  }
+}
