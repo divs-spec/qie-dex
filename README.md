@@ -1306,9 +1306,7 @@ Project Link: [https://github.com/divs-spec/qie-dex](https://github.com/divs-spe
 
 - Thanks to QIE-DEX for inspiration
 - Node.js & React.js for making development easier
-
 ---
-
 ⭐ If you find this project useful, please consider giving it a star on GitHub!
 
 **Made with ❤️ by Divyani**
